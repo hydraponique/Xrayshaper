@@ -21,7 +21,6 @@ check_ubuntu_debian() {
 
 # --- Загрузка модуля ifb ---
 load_ifb_module() {
-    
     # Пробуем загрузить модуль
     if modprobe ifb numifbs=1 2>/dev/null; then
         echo "Модуль ifb успешно загружен"
