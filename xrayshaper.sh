@@ -10,6 +10,12 @@ VERSION=100
 CONFIG="/etc/xrayshaper.conf"
 SERVICE="/etc/systemd/system/xrayshaper.service"
 SCRIPT_PATH="/usr/local/bin/xrayshaper"
+LOG_FILE="/var/log/xrayshaper.log"
+
+# --- Логирование для отладки ---
+log_message() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
 
 # --- Проверка на ОС ---
 check_ubuntu_debian() {
@@ -321,30 +327,37 @@ BURST="$BURST"
 CBURST="$CBURST"
 EOF
 
-    # Создаём systemd-сервис
-    echo "Создаётся systemd-сервис..."
-    cat > "$SERVICE" <<EOF
-[Unit]
-Description=Xrayshaper — fair bandwidth limiter for Xray/V2Ray with 95th percentile control
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=$SCRIPT_PATH enable
-ExecStop=$SCRIPT_PATH disable
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    # Копируем скрипт с заменой
-    echo "Копирование с заменой скрипта в $SCRIPT_PATH..."
-	rm -rf "$SCRIPT_PATH"
+    # Копируем скрипт ДО создания сервиса (ИСПРАВЛЕНИЕ #1: правильный порядок)
+    echo "Копирование скрипта в $SCRIPT_PATH..."
+    mkdir -p "$(dirname "$SCRIPT_PATH")"
     cp "$0" "$SCRIPT_PATH"
     chmod +x "$SCRIPT_PATH"
 
-    systemctl enable --now xrayshaper
+    # Создаём systemd-сервис (ИСПРАВЛЕНИЕ #2: правильная конфигурация)
+    echo "Создаётся systemd-сервис..."
+    cat > "$SERVICE" <<'SEOF'
+[Unit]
+Description=Xrayshaper — fair bandwidth limiter for Xray/V2Ray with 95th percentile control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xrayshaper enable
+ExecStop=/usr/local/bin/xrayshaper disable
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SEOF
+
+    # Перезагружаем systemd (ИСПРАВЛЕНИЕ #3: явный daemon-reload)
+    systemctl daemon-reload
+    systemctl enable xrayshaper
+    systemctl start xrayshaper
+    
     echo
     echo "Xrayshaper установлен, включен автоматически и добавлен в автозагрузку."
     read -n1 -r -p "Нажмите любую клавишу для продолжения..." key
@@ -373,14 +386,18 @@ help_screen() {
 
 # --- Включение шейпинга ---
 apply_shaping() {
+    log_message "=== Применение шейпинга ==="
+    
     echo "Проверка конфигурации..."
     if ! validate_config; then
+        log_message "Ошибка: некорректная конфигурация"
         echo "Ошибка: некорректная конфигурация"
         exit 1
     fi
     
     source "$CONFIG"
     
+    log_message "Применение шейпинга на интерфейсе $IFACE..."
     echo "Применение шейпинга на интерфейсе $IFACE..."
     
     # Очистка предыдущих правил
@@ -444,19 +461,25 @@ apply_shaping() {
     tc filter add dev $IFB parent 2: protocol ip handle 100 fw flowid 2:20
 
     ip link set dev $IFACE txqueuelen 1000
+    log_message "Двусторонний шейпинг активирован."
     echo "Двусторонний шейпинг активирован."
 }
 
 # --- Отключение ---
 disable_shaping() {
+    log_message "=== Отключение шейпинга ==="
+    
     if ! validate_config 2>/dev/null; then
+        log_message "Конфигурация не найдена или некорректна"
         echo "Конфигурация не найдена или некорректна"
         return
     fi
     
     source "$CONFIG"
     
+    log_message "Отключение шейпинга на интерфейсе $IFACE..."
     echo "Отключение шейпинга на интерфейсе $IFACE..."
+    
     tc qdisc del dev $IFACE root 2>/dev/null
     tc qdisc del dev $IFACE ingress 2>/dev/null
     tc qdisc del dev $IFB root 2>/dev/null
@@ -464,6 +487,8 @@ disable_shaping() {
     ip link del $IFB 2>/dev/null
     iptables -t mangle -F OUTPUT
     iptables -t mangle -F INPUT
+    
+    log_message "Шейпинг отключен."
     echo "Шейпинг отключен."
 }
 
