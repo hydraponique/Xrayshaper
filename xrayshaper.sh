@@ -304,7 +304,21 @@ download_script() {
     return 0
 }
 
-# --- Установка параметров ---
+# --- Чтение текущих параметров или дефолтов ---
+read_config_or_defaults() {
+    if [[ -f "$CONFIG" ]]; then
+        source "$CONFIG"
+    else
+        IFACE=$(detect_iface)
+        IFB="ifb0"
+        RATE="5mbit"
+        CEIL="1gbit"
+        BURST="1m"
+        CBURST="1m"
+    fi
+}
+
+# --- Установка параметров (первая установка) ---
 install_shaper() {
     clear
     echo "=== Установка Xrayshaper ==="
@@ -346,7 +360,6 @@ BURST="$BURST"
 CBURST="$CBURST"
 EOF
 
-    # ИСПРАВЛЕНИЕ: Скачиваем скрипт с GitHub вместо cp $0
     echo "Установка скрипта..."
     mkdir -p "$(dirname "$SCRIPT_PATH")"
     
@@ -394,22 +407,88 @@ SEOF
 	show_status
 }
 
-# --- Переустановка параметров ---
+# --- Переконфигурирование параметров (без трогания бинарника) ---
+reconfigure_shaper() {
+    echo "=== Переконфигурирование Xrayshaper ==="
+    echo
+    
+    # Читаем текущий конфиг (или дефолты)
+    read_config_or_defaults
+    
+    echo "Текущие параметры:"
+    echo "  Интерфейс: $IFACE"
+    echo "  RATE: $RATE"
+    echo "  CEIL: $CEIL"
+    echo "  BURST: $BURST"
+    echo "  CBURST: $CBURST"
+    echo
+    echo "Введите новые параметры (нажмите Enter, чтобы оставить текущее значение)"
+    echo
+    
+    IFACE=$(read_validated "Интерфейс внешней сети [${IFACE}]: " "$IFACE" "validate_interface")
+    RATE=$(read_validated "Средняя скорость ограничения (95-й перцентиль) [${RATE}]: " "$RATE" "validate_rate")
+    CEIL=$(read_validated "Максимальный потолок скорости [${CEIL}]: " "$CEIL" "validate_rate")
+    BURST=$(read_validated "Burst [${BURST}]: " "$BURST" "validate_burst")
+    CBURST=$(read_validated "CBurst [${CBURST}]: " "$CBURST" "validate_burst")
+    
+    # Сохраняем новую конфигурацию
+    cat > "$CONFIG" <<EOF
+IFACE="$IFACE"
+IFB="ifb0"
+RATE="$RATE"
+CEIL="$CEIL"
+BURST="$BURST"
+CBURST="$CBURST"
+EOF
+    
+    echo "Перезагружаем сервис..."
+    systemctl daemon-reload
+    systemctl restart xrayshaper
+    
+    echo
+    echo "Параметры обновлены и сервис перезагружен."
+    sleep 1
+    show_status
+}
+
+# --- Переустановка параметров (без обновления бинарника) ---
 reinstall_shaper() {
-	# Отключаем systemd-сервис
     systemctl disable --now xrayshaper 2>/dev/null
-	sleep 1
-	install_shaper
+    sleep 1
+    reconfigure_shaper
+}
+
+# --- Обновление скрипта с GitHub (self-update) ---
+self_update() {
+    echo "=== Обновление Xrayshaper ==="
+    echo
+    
+    if ! download_script; then
+        echo "Ошибка: не удалось скачать обновление"
+        exit 1
+    fi
+    
+    echo "Скрипт успешно обновлён"
+    echo
+    echo "Перезагружаем сервис..."
+    systemctl daemon-reload
+    systemctl restart xrayshaper
+    
+    echo
+    echo "Обновление завершено."
+    sleep 1
+    show_status
 }
 
 # --- Команда help ---
 help_screen() {
 	echo "Команды для ручного администрирования:"
 	echo "==============================================================="
-	echo "sudo xrayshaper on - включить шейпинг"
-	echo "sudo xrayshaper off - отключить шейпинг"
-	echo "sudo xrayshaper status - посмотреть состояние"
+	echo "sudo xrayshaper enable  - включить шейпинг"
+	echo "sudo xrayshaper disable - отключить шейпинг"
+	echo "sudo xrayshaper status  - посмотреть состояние"
 	echo "sudo xrayshaper reinstall - переустановить с новыми значениями"
+	echo "sudo xrayshaper self-update - обновить скрипт с GitHub"
 	exit 1
 }
 
@@ -442,66 +521,63 @@ apply_shaping() {
     # Маркировка системного (неограниченного) трафика - ИСХОДЯЩИЙ
     iptables -t mangle -A OUTPUT -p tcp -m multiport --sports 22,53,853 -j MARK --set-mark 100 2>/dev/null
     iptables -t mangle -A OUTPUT -p tcp -m multiport --dports 22,53,853 -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A OUTPUT -p udp -m multiport --sports 53,853,123 -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A OUTPUT -p udp -m multiport --dports 53,853,123 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A OUTPUT -p udp -m multiport --sports 53,853 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A OUTPUT -p udp -m multiport --dports 53,853 -j MARK --set-mark 100 2>/dev/null
     iptables -t mangle -A OUTPUT -p icmp -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A OUTPUT -d 127.0.0.0/8 -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A OUTPUT -d 10.0.0.0/8 -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A OUTPUT -d 172.16.0.0/12 -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A OUTPUT -d 192.168.0.0/16 -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A OUTPUT -p tcp -m length --length 0:128 -m tcp --tcp-flags SYN,ACK,FIN,RST ACK -j MARK --set-mark 100 2>/dev/null
-
+    
     # Маркировка системного (неограниченного) трафика - ВХОДЯЩИЙ
-    iptables -t mangle -A INPUT -p tcp -m multiport --sports 22,53,853 -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A INPUT -p tcp -m multiport --dports 22,53,853 -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A INPUT -p udp -m multiport --sports 53,853,123 -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A INPUT -p udp -m multiport --dports 53,853,123 -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A INPUT -p icmp -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A INPUT -s 127.0.0.0/8 -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A INPUT -s 10.0.0.0/8 -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A INPUT -s 172.16.0.0/12 -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A INPUT -s 192.168.0.0/16 -j MARK --set-mark 100 2>/dev/null
-    iptables -t mangle -A INPUT -p tcp -m length --length 0:128 -m tcp --tcp-flags SYN,ACK,FIN,RST ACK -j MARK --set-mark 100 2>/dev/null
-
-    # Всё остальное маркируем ограниченным
-    iptables -t mangle -A OUTPUT -j MARK --set-mark 10 2>/dev/null
-    iptables -t mangle -A INPUT -j MARK --set-mark 10 2>/dev/null
-
-    # Исходящий трафик (upload)
-    tc qdisc add dev $IFACE root handle 1: htb default 10 r2q 25 2>/dev/null
-    tc class add dev $IFACE parent 1: classid 1:10 htb rate $RATE ceil $CEIL burst $BURST cburst $CBURST 2>/dev/null
-    tc class add dev $IFACE parent 1: classid 1:20 htb rate $CEIL ceil $CEIL 2>/dev/null
-    tc qdisc add dev $IFACE parent 1:10 handle 10: fq_codel limit 800 target 4ms interval 60ms noecn quantum 600 2>/dev/null
-    tc filter add dev $IFACE parent 1: protocol ip handle 10 fw flowid 1:10 2>/dev/null
-    tc filter add dev $IFACE parent 1: protocol ip handle 100 fw flowid 1:20 2>/dev/null
-
-    # Входящий трафик (download)
-    tc qdisc add dev $IFACE handle ffff: ingress 2>/dev/null
-    tc filter add dev $IFACE parent ffff: protocol all matchall action mirred egress redirect dev $IFB 2>/dev/null
-    tc qdisc add dev $IFB root handle 2: htb default 10 r2q 25 2>/dev/null
-    tc class add dev $IFB parent 2: classid 2:10 htb rate $RATE ceil $CEIL burst $BURST cburst $CBURST 2>/dev/null
-    tc class add dev $IFB parent 2: classid 2:20 htb rate $CEIL ceil $CEIL 2>/dev/null
-    tc qdisc add dev $IFB parent 2:10 handle 20: fq_codel limit 800 target 4ms interval 60ms noecn quantum 600 2>/dev/null
-    tc filter add dev $IFB parent 2: protocol ip handle 10 fw flowid 2:10 2>/dev/null
-    tc filter add dev $IFB parent 2: protocol ip handle 100 fw flowid 2:20 2>/dev/null
-
-    ip link set dev $IFACE txqueuelen 1000 2>/dev/null
-    log_message "Двусторонний шейпинг активирован."
-    echo "Двусторонний шейпинг активирован."
+    iptables -t mangle -A INPUT -p tcp -m multiport --dports 22,53,853 -j MARK --set-mark 200 2>/dev/null
+    iptables -t mangle -A INPUT -p tcp -m multiport --sports 22,53,853 -j MARK --set-mark 200 2>/dev/null
+    iptables -t mangle -A INPUT -p udp -m multiport --dports 53,853 -j MARK --set-mark 200 2>/dev/null
+    iptables -t mangle -A INPUT -p udp -m multiport --sports 53,853 -j MARK --set-mark 200 2>/dev/null
+    iptables -t mangle -A INPUT -p icmp -j MARK --set-mark 200 2>/dev/null
+    
+    # ------- ИСХОДЯЩИЙ ТРАФИК (Egress на eth0) -------
+    tc qdisc add dev $IFACE root handle 1: htb default 20
+    tc class add dev $IFACE parent 1: classid 1:10 htb rate $RATE ceil $CEIL burst $BURST cburst $CBURST
+    tc class add dev $IFACE parent 1: classid 1:20 htb rate 1gbit ceil 1gbit
+    
+    # fq_codel для класса 1:10
+    tc qdisc add dev $IFACE parent 1:10 handle 10: fq_codel noecn
+    # Пустой qdisc для класса 1:20 (системный трафик)
+    tc qdisc add dev $IFACE parent 1:20 handle 20: pfifo_fast
+    
+    # Фильтры для маршрутизации трафика в правильные классы (ИСХОДЯЩИЙ)
+    tc filter add dev $IFACE parent 1: protocol ip prio 100 handle 100 fw flowid 1:20  # mark=100 → класс 1:20 (неограниченный)
+    tc filter add dev $IFACE parent 1: protocol ip prio 200 flowid 1:10  # остальное → класс 1:10 (ограниченный)
+    
+    # ------- ВХОДЯЩИЙ ТРАФИК (Ingress через ifb0) -------
+    # Редирект входящего трафика на IFB
+    tc filter add dev $IFACE parent ffff: protocol ip u32 match u32 0 0 0 action mirred egress redirect dev $IFB 2>/dev/null
+    
+    # Конфигурация IFB (2:10 и 2:20 для входящего трафика)
+    tc qdisc add dev $IFB root handle 2: htb default 20
+    tc class add dev $IFB parent 2: classid 2:10 htb rate $RATE ceil $CEIL burst $BURST cburst $CBURST
+    tc class add dev $IFB parent 2: classid 2:20 htb rate 1gbit ceil 1gbit
+    
+    # fq_codel для класса 2:10
+    tc qdisc add dev $IFB parent 2:10 handle 20: fq_codel noecn
+    # Пустой qdisc для класса 2:20
+    tc qdisc add dev $IFB parent 2:20 handle 30: pfifo_fast
+    
+    # Фильтры для маршрутизации входящего трафика (Ingress)
+    tc filter add dev $IFB parent 2: protocol ip prio 100 handle 200 fw flowid 2:20  # mark=200 → класс 2:20 (неограниченный)
+    tc filter add dev $IFB parent 2: protocol ip prio 200 flowid 2:10  # остальное → класс 2:10 (ограниченный)
+    
+    log_message "Шейпинг успешно применён: $IFACE / $RATE (ceil $CEIL)"
+    echo "Шейпинг успешно применён!"
 }
 
-# --- Отключение ---
-disable_shaping() {
-    if ! validate_config 2>/dev/null; then
-        log_message "Конфигурация не найдена или некорректна"
-        echo "Конфигурация не найдена или некорректна"
-        return
+# --- Отключение шейпинга ---
+remove_shaping() {
+    if [[ ! -f "$CONFIG" ]]; then
+        echo "Ошибка: конфигурация не найдена"
+        return 1
     fi
     
     source "$CONFIG"
     
-    log_message "Отключение шейпинга на интерфейсе $IFACE..."
-    echo "Отключение шейпинга на интерфейсе $IFACE..."
+    echo "Отключение шейпинга..."
     
     tc qdisc del dev $IFACE root 2>/dev/null
     tc qdisc del dev $IFACE ingress 2>/dev/null
@@ -511,93 +587,64 @@ disable_shaping() {
     iptables -t mangle -F OUTPUT 2>/dev/null
     iptables -t mangle -F INPUT 2>/dev/null
     
-    log_message "Шейпинг отключен."
-    echo "Шейпинг отключен."
+    log_message "Шейпинг отключён"
+    echo "Шейпинг успешно отключён!"
 }
 
-# --- Меню состояния ---
+# --- Показать статус ---
 show_status() {
-    clear
-    echo "------------Xrayshaper 1.0.0------------"
-    systemctl is-active --quiet xrayshaper && STATUS="✓ активен" || STATUS="✗ не активен"
-    systemctl is-enabled --quiet xrayshaper && ENABLED="✓ в автозагрузке" || ENABLED="✗ не в автозагрузке"
-	systemctl is-failed --quiet xrayshaper && STATUS="✗ ошибка"
-	
-    echo "Сервис:      $STATUS ($ENABLED)"
-    
-    if [ -f "$CONFIG" ]; then
-        if validate_config; then
-            source "$CONFIG"
-            echo "Конфиг:      ✓ валидный"
-        else
-            echo "Конфиг:      ✗ ошибка"
-        fi
-    else
-        echo "Конфиг не найден"
+    if [[ ! -f "$CONFIG" ]]; then
+        echo "Xrayshaper не установлен"
+        exit 1
     fi
-	
-    echo "-----------------Конфиг-----------------"
-    [ -f "$CONFIG" ] && source "$CONFIG" 2>/dev/null
-    echo "Интерфейс:   ${IFACE:-eth0}"
-    echo "Вирт. ifb:   ${IFB:-ifb0}"
-    echo "Тип очереди: HTB + FQ-CoDel"
-    echo "Ограничение: ${RATE:-5mbit} (ceil ${CEIL:-1gbit})"
-    echo "Burst:       ${BURST:-1m}"
-    echo "CBurst:      ${CBURST:-1m}"
-	if [ "$STATUS" = "✓ активен" ]; then
-		echo "-----------------Статус-----------------"
-		echo "Egress (исходящий ${IFACE:-eth0}):"
-		tc -s class show dev ${IFACE:-eth0} 2>/dev/null | grep -E "class htb 1:" | sed 's/^/  /'
-		echo "Ingress (входящий ${IFB:-ifb0}):"
-		tc -s class show dev ${IFB:-ifb0} 2>/dev/null | grep -E "class htb 2:" | sed 's/^/  /'
-		echo "----------------------------------------"
-		echo "  ${IFACE:-eth0} → 1:10 (upload)"
-		echo "  ${IFB:-ifb0} → 2:10 (download)"
-	fi
-	echo "----------------------------------------"
-	echo
-    echo "1) Включить шейпинг"
-    echo "2) Выключить шейпинг"
-    echo "3) Переустановить"
-    echo "4) Выход"
-    echo -n "Выберите действие [1-4]: "
-    read choice
-    case $choice in
-        1)
-		systemctl start xrayshaper
-		sleep 3
-		show_status
-		;;
-        2)
-		systemctl stop xrayshaper
-		sleep 3
-		show_status
-		;;
-        3) reinstall_shaper ;;
-        4) exit 0 ;;
-    esac
+    
+    source "$CONFIG"
+    
+    echo
+    echo "=========== Статус Xrayshaper ==========="
+    echo "Интерфейс: $IFACE"
+    echo "RATE: $RATE | CEIL: $CEIL"
+    echo "BURST: $BURST | CBURST: $CBURST"
+    echo
+    echo "----- Очереди (EGRESS / $IFACE) -----"
+    tc -s qdisc show dev $IFACE 2>/dev/null || echo "Шейпинг не активен"
+    echo
+    echo "----- Классы -----"
+    tc -s class show dev $IFACE 2>/dev/null
+    tc -s class show dev $IFB 2>/dev/null
+    echo
+    echo "----- Очереди (INGRESS / $IFB) -----"
+    tc -s qdisc show dev $IFB 2>/dev/null
+    echo
+    echo "========================================"
 }
 
-# --- Аргументы запуска ---
+# --- Main ---
+if [[ $EUID -ne 0 ]]; then
+    echo "Ошибка: требуются права суперпользователя (sudo)"
+    exit 1
+fi
+
 case "$1" in
-    on)
-	systemctl start xrayshaper
-	echo "Xrayshaper включен."
-	;;
-    off)
-	systemctl stop xrayshaper
-	echo "Xrayshaper отключен."
-	;;
-    enable) apply_shaping ;;
-    disable) disable_shaping ;;
-	status) show_status ;;
-	reinstall) reinstall_shaper ;;
-	help) help_screen ;;
+    install)
+        install_shaper
+        ;;
+    reinstall)
+        reinstall_shaper
+        ;;
+    self-update)
+        self_update
+        ;;
+    enable|on)
+        apply_shaping
+        ;;
+    disable|off)
+        remove_shaping
+        ;;
+    status)
+        show_status
+        ;;
     *)
-        if [ ! -f "$CONFIG" ]; then
-            install_shaper
-        else
-            show_status
-        fi
+        help_screen
         ;;
 esac
