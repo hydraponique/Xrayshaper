@@ -1,11 +1,11 @@
 #!/bin/bash
-# Xrayshaper 1.0.0 — двусторонний fair-use лимитер для Xray/V2Ray с контролем 95ого перцентиля
+# Xrayshaper 1.0.1 — двусторонний fair-use лимитер для Xray/V2Ray с контролем 95ого перцентиля
 # ============================================================================================
 # Тип очереди: HTB (Egress/Ingress) + fq_codel (Egress/Ingress) + ifb (Ingress)
-# Автор: @hydraponique
+# Автор: @hydraponique + сообщество Github
 # Совместимость: Ubuntu 18.04+/Debian 10+ (Linux >= 5.15, iproute2 >= 6.0)
 
-VERSION=100
+VERSION=101
 
 CONFIG="/etc/xrayshaper.conf"
 SERVICE="/etc/systemd/system/xrayshaper.service"
