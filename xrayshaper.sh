@@ -10,6 +10,12 @@ VERSION=100
 CONFIG="/etc/xrayshaper.conf"
 SERVICE="/etc/systemd/system/xrayshaper.service"
 SCRIPT_PATH="/usr/local/bin/xrayshaper"
+LOG_FILE="/var/log/xrayshaper.log"
+
+# --- Логирование для отладки ---
+log_message() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
 
 # --- Проверка на ОС ---
 check_ubuntu_debian() {
@@ -279,6 +285,25 @@ read_validated() {
     done
 }
 
+# --- Скачивание скрипта с GitHub ---
+download_script() {
+    local url="https://raw.githubusercontent.com/hydraponique/Xrayshaper/main/xrayshaper.sh"
+    log_message "Скачивание скрипта с GitHub..."
+    
+    if ! curl -sL "$url" -o "$SCRIPT_PATH" 2>/dev/null; then
+        echo "Ошибка: не удалось скачать скрипт"
+        return 1
+    fi
+    
+    if ! chmod +x "$SCRIPT_PATH" 2>/dev/null; then
+        echo "Ошибка: не удалось установить права на скрипт"
+        return 1
+    fi
+    
+    log_message "Скрипт успешно скачан и установлен в $SCRIPT_PATH"
+    return 0
+}
+
 # --- Установка параметров ---
 install_shaper() {
     clear
@@ -321,30 +346,47 @@ BURST="$BURST"
 CBURST="$CBURST"
 EOF
 
+    # ИСПРАВЛЕНИЕ: Скачиваем скрипт с GitHub вместо cp $0
+    echo "Установка скрипта..."
+    mkdir -p "$(dirname "$SCRIPT_PATH")"
+    
+    if ! download_script; then
+        # Fallback: если скачивание не сработало, копируем текущий скрипт
+        if [[ -s "$0" && "$0" != "/dev/stdin" && "$0" != "/proc/self/fd"* ]]; then
+            log_message "Fallback: копирование текущего скрипта"
+            cp "$0" "$SCRIPT_PATH"
+            chmod +x "$SCRIPT_PATH"
+        else
+            echo "Ошибка: не удалось установить скрипт"
+            exit 1
+        fi
+    fi
+
     # Создаём systemd-сервис
     echo "Создаётся systemd-сервис..."
-    cat > "$SERVICE" <<EOF
+    cat > "$SERVICE" <<'SEOF'
 [Unit]
 Description=Xrayshaper — fair bandwidth limiter for Xray/V2Ray with 95th percentile control
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$SCRIPT_PATH enable
-ExecStop=$SCRIPT_PATH disable
+ExecStart=/usr/local/bin/xrayshaper enable
+ExecStop=/usr/local/bin/xrayshaper disable
 RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SEOF
 
-    # Копируем скрипт с заменой
-    echo "Копирование с заменой скрипта в $SCRIPT_PATH..."
-	rm -rf "$SCRIPT_PATH"
-    cp "$0" "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-
-    systemctl enable --now xrayshaper
+    # Перезагружаем systemd
+    systemctl daemon-reload
+    systemctl enable xrayshaper
+    systemctl start xrayshaper
+    
     echo
     echo "Xrayshaper установлен, включен автоматически и добавлен в автозагрузку."
     read -n1 -r -p "Нажмите любую клавишу для продолжения..." key
@@ -355,7 +397,7 @@ EOF
 # --- Переустановка параметров ---
 reinstall_shaper() {
 	# Отключаем systemd-сервис
-    systemctl disable --now xrayshaper
+    systemctl disable --now xrayshaper 2>/dev/null
 	sleep 1
 	install_shaper
 }
@@ -389,81 +431,87 @@ apply_shaping() {
     tc qdisc del dev $IFB root 2>/dev/null
     ip link set $IFB down 2>/dev/null
     ip link del $IFB 2>/dev/null
-    iptables -t mangle -F OUTPUT
-    iptables -t mangle -F INPUT
+    iptables -t mangle -F OUTPUT 2>/dev/null
+    iptables -t mangle -F INPUT 2>/dev/null
 
     # Создание и настройка IFB для входящего трафика
     modprobe ifb numifbs=1 2>/dev/null
-    ip link add name $IFB type ifb
-    ip link set $IFB up
+    ip link add name $IFB type ifb 2>/dev/null
+    ip link set $IFB up 2>/dev/null
 
     # Маркировка системного (неограниченного) трафика - ИСХОДЯЩИЙ
-    iptables -t mangle -A OUTPUT -p tcp -m multiport --sports 22,53,853 -j MARK --set-mark 100                                  # SSH, DNS, DoT (source)
-    iptables -t mangle -A OUTPUT -p tcp -m multiport --dports 22,53,853 -j MARK --set-mark 100                                  # SSH, DNS, DoT (destination)
-    iptables -t mangle -A OUTPUT -p udp -m multiport --sports 53,853,123 -j MARK --set-mark 100                                 # DNS, DoT, NTP (source)
-    iptables -t mangle -A OUTPUT -p udp -m multiport --dports 53,853,123 -j MARK --set-mark 100                                 # DNS, DoT, NTP (destination)
-    iptables -t mangle -A OUTPUT -p icmp -j MARK --set-mark 100                                                                 # Ping/ICMP
-    iptables -t mangle -A OUTPUT -d 127.0.0.0/8 -j MARK --set-mark 100                                                          # Localhost
-    iptables -t mangle -A OUTPUT -d 10.0.0.0/8 -j MARK --set-mark 100                                                           # Private network
-    iptables -t mangle -A OUTPUT -d 172.16.0.0/12 -j MARK --set-mark 100                                                        # Private network
-    iptables -t mangle -A OUTPUT -d 192.168.0.0/16 -j MARK --set-mark 100                                                       # Private network
-    iptables -t mangle -A OUTPUT -p tcp -m length --length 0:128 -m tcp --tcp-flags SYN,ACK,FIN,RST ACK -j MARK --set-mark 100  # TCP ACK пакеты (маленькие подтверждения)
+    iptables -t mangle -A OUTPUT -p tcp -m multiport --sports 22,53,853 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A OUTPUT -p tcp -m multiport --dports 22,53,853 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A OUTPUT -p udp -m multiport --sports 53,853,123 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A OUTPUT -p udp -m multiport --dports 53,853,123 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A OUTPUT -p icmp -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A OUTPUT -d 127.0.0.0/8 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A OUTPUT -d 10.0.0.0/8 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A OUTPUT -d 172.16.0.0/12 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A OUTPUT -d 192.168.0.0/16 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A OUTPUT -p tcp -m length --length 0:128 -m tcp --tcp-flags SYN,ACK,FIN,RST ACK -j MARK --set-mark 100 2>/dev/null
 
     # Маркировка системного (неограниченного) трафика - ВХОДЯЩИЙ
-    iptables -t mangle -A INPUT -p tcp -m multiport --sports 22,53,853 -j MARK --set-mark 100                                   # SSH, DNS, DoT (source)
-    iptables -t mangle -A INPUT -p tcp -m multiport --dports 22,53,853 -j MARK --set-mark 100                                   # SSH, DNS, DoT (destination)
-    iptables -t mangle -A INPUT -p udp -m multiport --sports 53,853,123 -j MARK --set-mark 100                                  # DNS, DoT, NTP (source)
-    iptables -t mangle -A INPUT -p udp -m multiport --dports 53,853,123 -j MARK --set-mark 100                                  # DNS, DoT, NTP (destination)
-    iptables -t mangle -A INPUT -p icmp -j MARK --set-mark 100                                                                  # Ping/ICMP
-    iptables -t mangle -A INPUT -s 127.0.0.0/8 -j MARK --set-mark 100                                                           # Localhost
-    iptables -t mangle -A INPUT -s 10.0.0.0/8 -j MARK --set-mark 100                                                            # Private network
-    iptables -t mangle -A INPUT -s 172.16.0.0/12 -j MARK --set-mark 100                                                         # Private network
-    iptables -t mangle -A INPUT -s 192.168.0.0/16 -j MARK --set-mark 100                                                        # Private network
-    iptables -t mangle -A INPUT -p tcp -m length --length 0:128 -m tcp --tcp-flags SYN,ACK,FIN,RST ACK -j MARK --set-mark 100   # TCP ACK пакеты (маленькие подтверждения)
+    iptables -t mangle -A INPUT -p tcp -m multiport --sports 22,53,853 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A INPUT -p tcp -m multiport --dports 22,53,853 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A INPUT -p udp -m multiport --sports 53,853,123 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A INPUT -p udp -m multiport --dports 53,853,123 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A INPUT -p icmp -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A INPUT -s 127.0.0.0/8 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A INPUT -s 10.0.0.0/8 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A INPUT -s 172.16.0.0/12 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A INPUT -s 192.168.0.0/16 -j MARK --set-mark 100 2>/dev/null
+    iptables -t mangle -A INPUT -p tcp -m length --length 0:128 -m tcp --tcp-flags SYN,ACK,FIN,RST ACK -j MARK --set-mark 100 2>/dev/null
 
     # Всё остальное маркируем ограниченным
-    iptables -t mangle -A OUTPUT -j MARK --set-mark 10
-    iptables -t mangle -A INPUT -j MARK --set-mark 10
+    iptables -t mangle -A OUTPUT -j MARK --set-mark 10 2>/dev/null
+    iptables -t mangle -A INPUT -j MARK --set-mark 10 2>/dev/null
 
     # Исходящий трафик (upload)
-    tc qdisc add dev $IFACE root handle 1: htb default 10 r2q 25
-    tc class add dev $IFACE parent 1: classid 1:10 htb rate $RATE ceil $CEIL burst $BURST cburst $CBURST
-    tc class add dev $IFACE parent 1: classid 1:20 htb rate $CEIL ceil $CEIL
-    tc qdisc add dev $IFACE parent 1:10 handle 10: fq_codel limit 800 target 4ms interval 60ms noecn quantum 600
-    tc filter add dev $IFACE parent 1: protocol ip handle 10 fw flowid 1:10
-    tc filter add dev $IFACE parent 1: protocol ip handle 100 fw flowid 1:20
+    tc qdisc add dev $IFACE root handle 1: htb default 10 r2q 25 2>/dev/null
+    tc class add dev $IFACE parent 1: classid 1:10 htb rate $RATE ceil $CEIL burst $BURST cburst $CBURST 2>/dev/null
+    tc class add dev $IFACE parent 1: classid 1:20 htb rate $CEIL ceil $CEIL 2>/dev/null
+    tc qdisc add dev $IFACE parent 1:10 handle 10: fq_codel limit 800 target 4ms interval 60ms noecn quantum 600 2>/dev/null
+    tc filter add dev $IFACE parent 1: protocol ip handle 10 fw flowid 1:10 2>/dev/null
+    tc filter add dev $IFACE parent 1: protocol ip handle 100 fw flowid 1:20 2>/dev/null
 
     # Входящий трафик (download)
-    tc qdisc add dev $IFACE handle ffff: ingress
-    tc filter add dev $IFACE parent ffff: protocol all matchall action mirred egress redirect dev $IFB
-    tc qdisc add dev $IFB root handle 2: htb default 10 r2q 25
-    tc class add dev $IFB parent 2: classid 2:10 htb rate $RATE ceil $CEIL burst $BURST cburst $CBURST
-    tc class add dev $IFB parent 2: classid 2:20 htb rate $CEIL ceil $CEIL
-    tc qdisc add dev $IFB parent 2:10 handle 20: fq_codel limit 800 target 4ms interval 60ms noecn quantum 600
-    tc filter add dev $IFB parent 2: protocol ip handle 10 fw flowid 2:10
-    tc filter add dev $IFB parent 2: protocol ip handle 100 fw flowid 2:20
+    tc qdisc add dev $IFACE handle ffff: ingress 2>/dev/null
+    tc filter add dev $IFACE parent ffff: protocol all matchall action mirred egress redirect dev $IFB 2>/dev/null
+    tc qdisc add dev $IFB root handle 2: htb default 10 r2q 25 2>/dev/null
+    tc class add dev $IFB parent 2: classid 2:10 htb rate $RATE ceil $CEIL burst $BURST cburst $CBURST 2>/dev/null
+    tc class add dev $IFB parent 2: classid 2:20 htb rate $CEIL ceil $CEIL 2>/dev/null
+    tc qdisc add dev $IFB parent 2:10 handle 20: fq_codel limit 800 target 4ms interval 60ms noecn quantum 600 2>/dev/null
+    tc filter add dev $IFB parent 2: protocol ip handle 10 fw flowid 2:10 2>/dev/null
+    tc filter add dev $IFB parent 2: protocol ip handle 100 fw flowid 2:20 2>/dev/null
 
-    ip link set dev $IFACE txqueuelen 1000
+    ip link set dev $IFACE txqueuelen 1000 2>/dev/null
+    log_message "Двусторонний шейпинг активирован."
     echo "Двусторонний шейпинг активирован."
 }
 
 # --- Отключение ---
 disable_shaping() {
     if ! validate_config 2>/dev/null; then
+        log_message "Конфигурация не найдена или некорректна"
         echo "Конфигурация не найдена или некорректна"
         return
     fi
     
     source "$CONFIG"
     
+    log_message "Отключение шейпинга на интерфейсе $IFACE..."
     echo "Отключение шейпинга на интерфейсе $IFACE..."
+    
     tc qdisc del dev $IFACE root 2>/dev/null
     tc qdisc del dev $IFACE ingress 2>/dev/null
     tc qdisc del dev $IFB root 2>/dev/null
     ip link set $IFB down 2>/dev/null
     ip link del $IFB 2>/dev/null
-    iptables -t mangle -F OUTPUT
-    iptables -t mangle -F INPUT
+    iptables -t mangle -F OUTPUT 2>/dev/null
+    iptables -t mangle -F INPUT 2>/dev/null
+    
+    log_message "Шейпинг отключен."
     echo "Шейпинг отключен."
 }
 
