@@ -8,7 +8,7 @@
 ## Установка
 
 ```bash
-curl -sL https://raw.githubusercontent.com/hydraponique/xrayshaper/main/xrayshaper.sh | sudo bash
+bash <(curl -sL https://raw.githubusercontent.com/hydraponique/xrayshaper/main/xrayshaper.sh)
 ```
 
 ## 🔥 Ключевые особенности
